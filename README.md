@@ -1,129 +1,176 @@
 # System Config Inspector
 
-A lightweight, read-only **Universal Linux Environment Inspector** with both a terminal report and a professional browser dashboard. It uses Python's standard library only, including the built-in `http.server`; it has no third-party packages, frontend framework, cloud SDK, database, telemetry, runtime installation, or external network calls.
+A lightweight, read-only **Universal Linux Environment Inspector** for containers, VPSs, VMs, bare metal, Kubernetes, Render, AWS ECS/Fargate, Docker and similar Linux runtimes.
 
-The same one-time inspection result powers both the CLI output and the dashboard. Values are never fabricated: unavailable metrics are displayed as `Unknown / Not exposed`.
+It uses **Python standard library only**. Bash is used only for startup. There is no browser GUI, RDP, VNC, desktop environment, frontend framework, database, telemetry, cloud SDK, or external network dependency.
+
+The inspector never invents values. When the runtime does not expose a metric it prints:
+
+```text
+Unknown / Not exposed
+```
 
 ## Modes
 
-One-shot CLI inspection:
+### One-shot inspection
 
 ```bash
 python system_info.py --once
 ```
 
-Long-running browser dashboard:
+Prints the complete report and exits.
+
+### Long-running deployment mode
+
+Some platforms such as Render Web Services require a process to keep listening. Use:
 
 ```bash
 python system_info.py --serve
 ```
 
-The environment variable `INSPECTOR_MODE=once|serve` can select the mode. If no mode is specified, the default is `serve`, which is appropriate for a Render Web Service. `start.sh` launches serve mode by default and honors `INSPECTOR_MODE=once` when explicitly set.
+This mode performs the same inspection first, prints the report to deployment logs, then keeps a tiny HTTP listener alive on `0.0.0.0:$PORT` (fallback `10000`). It exposes only:
 
-## Browser dashboard
+```text
+GET /healthz -> 200 ok
+```
 
-The standard-library HTTP server binds to `0.0.0.0:$PORT`, using port `10000` only when `PORT` is absent or invalid. It performs the inspection once at startup, stores the structured result in memory, and does not re-run collectors for requests.
+There is **no GUI and no conventional application API**.
 
-| Method | Route | Behavior |
-|---|---|---|
-| `GET` | `/` | Responsive HTML dashboard containing every successfully collected metric. |
-| `GET` | `/healthz` | HTTP 200 with `ok`. |
-| `HEAD` | `/`, `/healthz` | Header-only equivalent. |
-| Other | Any route | HTTP 404. |
+`INSPECTOR_MODE=once|serve` can select the mode. Command-line `--once` or `--serve` takes precedence.
 
-The dashboard is built entirely with semantic HTML, inline CSS, responsive cards, tables, badges, collapsible metric sections, monospace technical values, source/scope labels, and a reliable visible-memory progress indicator. It loads no external CSS, JavaScript, fonts, images, or APIs.
+## What it inspects
 
-Every metric is shown with an explanatory source and scope where useful. For example, cgroup CPU is labeled as allocated/enforced, while `/proc` CPU and memory values are labeled as visible runtime resources. Host-visible resources are never presented as service allocations.
+- **SYSTEM** — OS, distribution, kernel, architecture, hostname, uptime, boot time, timezone, locale, init/systemd, user and shell.
+- **CPU** — model, vendor, architecture, logical/online/offline CPUs, topology, frequency, flags, affinity, quota, period, weight/shares, cpuset, calculated vCPU and provider-reported CPU where exposed.
+- **MEMORY** — host-visible memory, available/used/free, buffers/cache, cgroup current/high/max, allocation/limit, swap and memory pressure/events.
+- **STORAGE** — visible root filesystem capacity, usage, free space, filesystem type, mount information, options, read-only state, inodes, filesystems and block devices. Provider disk allocation is kept separate and is reported only when actually exposed.
+- **CONTAINER / CGROUP** — container evidence, confidence, cgroup v1/v2, path, controllers, CPU/memory/PID/I/O limits.
+- **NAMESPACES** — PID, mount, network, IPC, UTS, user and cgroup namespaces.
+- **PROCESS** — PID/PPID, executable, command line, UID/GID, groups, threads, process state and process limits.
+- **NETWORK** — local interfaces, state, MAC, MTU, routes, default route, DNS configuration and `/etc/hosts`. No external DNS/HTTP request is made.
+- **RUNTIME** — Python version, implementation, executable, architecture, compiler, build, cwd, prefixes, virtualenv, site-packages and `sys.path` count.
+- **RESOURCE ALLOCATION** — actual cgroup-enforced CPU, memory and PID allocation separated from host-visible resources.
+- **RESOURCE LIMITS** — relevant process `RLIMIT_*` values.
+- **VIRTUALIZATION** — local evidence and confidence; no guessing from hostnames/IPs/CPU models.
+- **SECURITY** — root status, capabilities, no-new-privileges, seccomp, AppArmor, SELinux and filesystem read-only state.
+- **PLATFORM** — strong provider detection with confidence and evidence.
+- **SAFE ENVIRONMENT** — only explicitly allowlisted deployment metadata.
 
-## Dashboard sections
+## Resource terminology
 
-The dashboard includes overview cards and detailed sections for system identity, resource allocation, CPU, memory, storage, container/cgroup state, namespaces, process state, network metadata, Python runtime, process resource limits, virtualization, security, provider/platform evidence, and the safe environment allowlist.
+The inspector deliberately distinguishes:
 
-The inspector reports CPU topology, model, vendor, logical/online/offline counts, frequency, flags, affinity, cgroup quota/period/weight, cpuset, calculated vCPU, and provider-reported allocation. Memory reporting separates host-visible memory from cgroup allocation/limit, current/high/max/swap limits, pressure, and events. Storage reporting separates visible filesystem capacity from provider disk allocation and includes filesystem, mount, inode, and block-device details where exposed.
+1. **Host-visible resources** — what `/proc`, `/sys` or the mounted filesystem makes visible.
+2. **Container-visible resources** — what the current namespace/container exposes.
+3. **Enforced/allocated resources** — cgroup limits that actually constrain the process/container.
+4. **Provider-reported resources** — explicit values supplied by a deployment platform.
+
+For example, a container may see 30 GB of host memory while its cgroup limit is only 512 MB. Those values must never be presented as the same allocation.
+
+Likewise, visible root filesystem capacity is **not automatically the provider's persistent-disk allocation**.
+
+## Provider detection
+
+Provider detection uses strong evidence instead of weak guesses. Examples include:
+
+- Render: `RENDER=true` or explicit Render service variables.
+- AWS ECS/Fargate: `AWS_EXECUTION_ENV=AWS_ECS_FARGATE`.
+- AWS ECS: ECS metadata environment variables.
+- Kubernetes: `KUBERNETES_SERVICE_HOST`.
+- Cloud Run: `K_SERVICE` / `K_REVISION`.
+- Railway, Fly.io, Vercel, Heroku and other supported platforms: explicit platform variables.
+
+Hostnames, IP addresses, CPU model names, kernel strings and generic cloud-looking values are not sufficient provider evidence.
+
+## cgroup and architecture support
+
+The inspector supports both:
+
+- cgroup v1
+- cgroup v2
+
+and common architectures including:
+
+- x86_64 / amd64
+- aarch64 / arm64
+- other ARM variants where the runtime exposes the information.
+
+An unavailable CPU model or topology value is never represented as a fake `0`.
 
 ## Security and privacy
 
-The service is read-only. HTTP requests cannot execute commands, modify files, modify environment variables, or trigger another inspection. No external DNS or network requests are performed.
+The environment is **not** dumped wholesale. Only allowlisted deployment metadata is eligible for output. Secret-like names such as passwords, tokens, API keys, credentials, private keys, cookies, sessions, certificates and similar values are omitted.
 
-The environment is never dumped blindly. Only explicitly allowlisted deployment metadata is eligible for display, and secret-like names or credential-bearing values are omitted. This includes passwords, tokens, API keys, authentication values, private keys, database URLs, connection strings, JWTs, cookies, sessions, certificates, SSH values, and other secret indicators. The report includes:
+The report ends with:
 
 ```text
 Secret-like and non-allowlisted environment variables are intentionally omitted.
 ```
 
+Collectors are isolated so a missing `/proc`, `/sys`, cgroup file, permission, kernel feature or provider variable cannot crash the whole inspection.
+
 ## Deployment
 
 ### Render Web Service
 
-Use the repository as a Render Web Service with:
+Use:
 
 ```text
 Build Command: No build command required
 Start Command: python system_info.py --serve
 ```
 
-The service reads Render's `PORT`, binds to `0.0.0.0`, prints the complete CLI report to stdout, serves the dashboard at `/`, responds to `/healthz`, and remains alive until shutdown.
-
-### Native Python
-
-```bash
-python system_info.py --serve
-```
-
-For a one-shot environment:
-
-```bash
-python system_info.py --once
-```
+The service prints the complete inspection report to Render logs, binds to `0.0.0.0:$PORT`, remains alive, and responds to `/healthz`.
 
 ### Docker
 
 ```bash
 docker build -t system-config-inspector .
-docker run --rm -e PORT=10000 -p 10000:10000 system-config-inspector
+docker run --rm system-config-inspector
 ```
 
-The Dockerfile uses the official `python:3.12-slim` image, installs nothing, starts `start.sh`, and keeps the web service in the foreground. The same image can run one-shot mode with `-e INSPECTOR_MODE=once`.
-
-### VPS or bare metal
-
-Run the service under the platform's process supervisor or directly in the foreground:
+For a long-running container:
 
 ```bash
-PORT=10000 python system_info.py --serve
+docker run --rm -e INSPECTOR_MODE=serve -e PORT=10000 -p 10000:10000 system-config-inspector
 ```
 
-The service handles `SIGTERM` and `SIGINT`, prints a concise shutdown message, closes the listener, and exits cleanly.
+### Native Linux / VPS / VM / bare metal
 
-## CLI report and portability
+```bash
+python3 system_info.py --once
+```
 
-The CLI report remains available and contains readable sections for:
+or:
 
-`SYSTEM`, `CPU`, `MEMORY`, `STORAGE`, `CONTAINER / CGROUP`, `NAMESPACES`, `PROCESS`, `NETWORK`, `RUNTIME`, `RESOURCE ALLOCATION`, `RESOURCE LIMITS`, `VIRTUALIZATION`, `SECURITY`, `PLATFORM`, and `SAFE ENVIRONMENT`.
+```bash
+PORT=10000 python3 system_info.py --serve
+```
 
-The implementation supports standard Linux environments, Docker, Docker Compose, Kubernetes, ECS/Fargate, EC2, Render, Railway, Fly.io, VPSs, virtual machines, bare metal, x86_64, ARM64/aarch64, cgroup v1, cgroup v2, restricted permissions, and partially unavailable `/proc` or `/sys` files. Each collector is isolated so one missing source cannot prevent the rest of the report or dashboard from rendering.
+### Kubernetes / ECS / Fargate
 
-Provider detection uses strong explicit evidence only. Examples include `RENDER=true`, `AWS_EXECUTION_ENV=AWS_ECS_FARGATE`, ECS metadata variables, and `KUBERNETES_SERVICE_HOST`. Hostnames, IP addresses, CPU models, kernels, filesystems, and arbitrary strings are not used to guess providers.
+Run the inspector as the workload/container you want to inspect. It reports only resources visible and enforceable from that runtime. Provider allocation is shown only when reliable provider evidence is available.
 
 ## Validation
 
 ```bash
 python3 -m py_compile system_info.py
 bash -n start.sh
-python system_info.py --once
-PORT=10000 python system_info.py --serve
-curl -i http://127.0.0.1:10000/
-curl -i http://127.0.0.1:10000/healthz
-curl -i http://127.0.0.1:10000/unknown
+python3 system_info.py --once
 ```
 
-If Docker is available:
+For long-running mode:
 
 ```bash
-docker build -t system-config-inspector .
-docker run --rm -e PORT=10000 -p 10000:10000 system-config-inspector
+PORT=10000 python3 system_info.py --serve
+```
+
+Then check:
+
+```bash
+curl -i http://127.0.0.1:10000/healthz
 ```
 
 ## Limitations
 
-The inspector can only report what the current runtime exposes. A container may not see the physical host's complete hardware configuration, and visible filesystem capacity is not automatically provider persistent-disk allocation. Cgroup, namespace, security, DMI, network, and provider data may be restricted or unavailable. Unknown values remain unknown rather than guessed.
+A container cannot necessarily see the physical host's complete hardware configuration. Provider disk allocation, physical CPU topology, security controls, IP addresses and other metrics may be intentionally hidden by the runtime. The correct output in those cases is `Unknown / Not exposed` rather than an estimate.
