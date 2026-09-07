@@ -3,13 +3,9 @@
 
 from __future__ import annotations
 
-import contextlib
-import dataclasses
 import datetime
 import getpass
-import html
-import http.server
-import io
+import locale
 import math
 import os
 import platform
@@ -18,1036 +14,406 @@ import resource
 import shutil
 import signal
 import socket
-import socketserver
 import sys
-import locale
 import site
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any, Callable
 
 UNKNOWN = "Unknown / Not exposed"
 UNLIMITED = "Unlimited / No enforced limit"
-
-# Only these environment variables are eligible for display. Values are still
-# bounded and filtered; an allowlist is safer than printing the environment.
-SAFE_ENVIRONMENT_NAMES = {
-    "PORT", "RENDER", "RENDER_CPU_COUNT", "RENDER_SERVICE_NAME",
-    "RENDER_SERVICE_TYPE", "RENDER_REGION", "RENDER_GIT_BRANCH",
-    "RENDER_GIT_COMMIT", "AWS_REGION", "AWS_EXECUTION_ENV",
-    "AWS_LAMBDA_FUNCTION_NAME", "ECS_CONTAINER_METADATA_URI_V4", "ECS_CONTAINER_METADATA_URI", "KUBERNETES_SERVICE_HOST", "K_SERVICE", "K_REVISION", "DYNO",
-    "HEROKU_APP_NAME", "VERCEL", "RAILWAY_ENVIRONMENT", "FLY_APP_NAME",
+SAFE_ENV_NAMES = {
+    "PORT", "RENDER", "RENDER_CPU_COUNT", "RENDER_SERVICE_NAME", "RENDER_SERVICE_TYPE",
+    "RENDER_REGION", "RENDER_GIT_BRANCH", "RENDER_GIT_COMMIT", "AWS_REGION",
+    "AWS_EXECUTION_ENV", "AWS_LAMBDA_FUNCTION_NAME", "ECS_CONTAINER_METADATA_URI_V4",
+    "ECS_CONTAINER_METADATA_URI", "KUBERNETES_SERVICE_HOST", "K_SERVICE", "K_REVISION",
+    "DYNO", "HEROKU_APP_NAME", "VERCEL", "RAILWAY_ENVIRONMENT", "FLY_APP_NAME",
     "GITHUB_ACTIONS", "CI", "NETLIFY", "CODEBUILD_BUILD_ARN",
 }
-SECRET_NAME_RE = re.compile(
-    r"(?:SECRET|PASSWORD|PASSWD|TOKEN|API[_-]?KEY|APIKEY|AUTH|PRIVATE[_-]?KEY|"
-    r"ACCESS[_-]?KEY|CREDENTIAL|DATABASE[_-]?URL|CONNECTION[_-]?STRING|JWT|"
-    r"COOKIE|SESSION|CERT|SSH)", re.IGNORECASE,
-)
+SECRET_RE = re.compile(r"SECRET|PASSWORD|PASSWD|TOKEN|API[_-]?KEY|APIKEY|AUTH|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL|DATABASE[_-]?URL|CONNECTION[_-]?STRING|JWT|COOKIE|SESSION|CERT|SSH", re.I)
 
 
-@dataclasses.dataclass(frozen=True)
-class Metric:
-    value: Any = UNKNOWN
-    unit: str = ""
-    source: str = UNKNOWN
-    scope: str = UNKNOWN
-    confidence: str = "UNKNOWN"
-    status: str = "unavailable"
-
-
-def safe_call(function: Callable[[], Any], default: Any = UNKNOWN) -> Any:
-    """Run one optional collector without allowing it to affect other output."""
+def safe(fn: Callable[[], Any], default: Any = UNKNOWN) -> Any:
     try:
-        return function()
+        return fn()
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         return default
 
 
-def read_text(path: str | Path) -> str | None:
+def read(path: str | Path) -> str | None:
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, PermissionError, OSError, UnicodeError):
+    except (OSError, UnicodeError):
         return None
 
 
-def first_line(path: str | Path) -> str | None:
-    content = read_text(path)
-    if not content:
-        return None
-    lines = content.splitlines()
-    return lines[0].strip() if lines else None
+def first(path: str | Path) -> str | None:
+    text = read(path)
+    return text.splitlines()[0].strip() if text and text.splitlines() else None
 
 
-def read_kv_file(path: str | Path, separator: str = "=") -> dict[str, str]:
-    result: dict[str, str] = {}
-    content = read_text(path)
-    if not content:
-        return result
-    for line in content.splitlines():
-        if separator not in line:
-            continue
-        key, value = line.split(separator, 1)
-        result[key.strip()] = value.strip().strip('"').strip("'")
-    return result
-
-
-def parse_int(value: Any) -> int | None:
+def integer(value: Any) -> int | None:
     try:
         return int(str(value).strip())
     except (TypeError, ValueError, OverflowError):
         return None
 
 
-def parse_float(value: Any) -> float | None:
+def number(value: Any) -> float | None:
     try:
-        number = float(str(value).strip())
-        return number if math.isfinite(number) else None
+        n = float(str(value).strip())
+        return n if math.isfinite(n) else None
     except (TypeError, ValueError, OverflowError):
         return None
 
 
-def parse_limit(value: str | None) -> int | None:
-    """Parse cgroup numeric limits; None means missing or unlimited."""
-    if value is None or value.strip().lower() in {"max", "unlimited", "none", "-1"}:
-        return None
-    return parse_int(value)
-
-
-def format_bytes(value: int | float | None, show_raw: bool = True) -> str:
+def bytes_text(value: int | float | None) -> str:
     if value is None or value < 0:
         return UNKNOWN
-    number = float(value)
+    n = float(value)
     units = ("B", "KB", "MB", "GB", "TB", "PB")
-    index = 0
-    while number >= 1024.0 and index < len(units) - 1:
-        number /= 1024.0
-        index += 1
-    formatted = f"{number:.1f} {units[index]}"
-    return f"{formatted} ({int(value):,} bytes)" if show_raw else formatted
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024
+        i += 1
+    return f"{n:.1f} {units[i]} ({int(value):,} bytes)"
 
 
-def format_limit(value: str | None) -> str:
-    if value is None:
+def limit_text(raw: str | None, count: bool = False) -> str:
+    if raw is None:
         return UNKNOWN
-    if value.strip().lower() in {"max", "unlimited", "none", "-1"}:
+    if raw.strip().lower() in {"max", "unlimited", "none", "-1"}:
         return UNLIMITED
-    numeric = parse_limit(value)
-    return format_bytes(numeric) if numeric is not None else UNKNOWN
-
-
-def format_count_limit(value: str | None) -> str:
-    if value is None:
+    value = integer(raw)
+    if value is None or value < 0:
         return UNKNOWN
-    if value.strip().lower() in {"max", "unlimited", "none", "-1"}:
-        return UNLIMITED
-    numeric = parse_int(value)
-    return f"{numeric:,} processes" if numeric is not None and numeric >= 0 else UNKNOWN
+    return f"{value:,} processes" if count else bytes_text(value)
 
 
-def format_uptime() -> str:
-    raw = first_line("/proc/uptime")
-    seconds = parse_float(raw.split()[0]) if raw else None
-    if seconds is None or seconds < 0:
-        return UNKNOWN
-    total = int(seconds)
-    days, remainder = divmod(total, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, secs = divmod(remainder, 60)
-    parts = ([f"{days}d"] if days else []) + ([f"{hours}h"] if hours or days else [])
-    parts += ([f"{minutes}m"] if minutes or hours or days else []) + [f"{secs}s"]
-    return " ".join(parts)
-
-
-def parse_meminfo() -> dict[str, int]:
-    result: dict[str, int] = {}
-    content = read_text("/proc/meminfo") or ""
-    for line in content.splitlines():
-        if ":" not in line:
+def cpu_set(raw: str | None) -> list[int]:
+    out: list[int] = []
+    if not raw:
+        return out
+    for part in raw.split(","):
+        try:
+            if "-" in part:
+                a, b = (int(x) for x in part.split("-", 1))
+                if 0 <= a <= b:
+                    out.extend(range(a, b + 1))
+            else:
+                x = int(part)
+                if x >= 0:
+                    out.append(x)
+        except ValueError:
             continue
-        key, value = line.split(":", 1)
-        fields = value.strip().split()
-        number = parse_int(fields[0]) if fields else None
-        if number is not None:
-            # Linux meminfo values are normally KiB; byte fields are not used here.
-            result[key.strip()] = number * 1024 if len(fields) > 1 and fields[1].lower() == "kb" else number
-    return result
+    return sorted(set(out))
 
 
-def cpuinfo_records() -> list[dict[str, str]]:
+def cpu_records() -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     current: dict[str, str] = {}
-    content = read_text("/proc/cpuinfo") or ""
-    for line in content.splitlines() + [""]:
+    for line in (read("/proc/cpuinfo") or "").splitlines() + [""]:
         if not line.strip():
             if current:
                 records.append(current)
                 current = {}
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
-            current[key.strip().lower()] = value.strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            current[k.strip().lower()] = v.strip()
     return records
 
 
-def parse_cpu_set(value: str | None) -> list[int]:
-    result: list[int] = []
-    if not value:
-        return result
-    for part in value.split(","):
-        try:
-            if "-" in part:
-                start, end = (int(piece) for piece in part.split("-", 1))
-                if 0 <= start <= end:
-                    result.extend(range(start, end + 1))
-            else:
-                number = int(part)
-                if number >= 0:
-                    result.append(number)
-        except (TypeError, ValueError):
-            continue
-    return sorted(set(result))
-
-
-def cpu_model() -> str:
-    for record in cpuinfo_records():
-        value = record.get("model name") or record.get("hardware") or record.get("cpu model")
-        if value and not value.isdigit():
-            return value
-    value = safe_call(platform.processor)
-    return value if value and not value.isdigit() else UNKNOWN
-
-
-def cpu_vendor() -> str:
-    for record in cpuinfo_records():
-        value = record.get("vendor_id") or record.get("vendor") or record.get("cpu implementer")
-        if value:
-            return value
-    return UNKNOWN
-
-
-def online_cpu_count() -> int | None:
-    raw = first_line("/sys/devices/system/cpu/online")
-    values = parse_cpu_set(raw)
-    return len(values) if values else os.cpu_count()
-
-
-def cpu_frequency() -> str:
-    for path in ("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq"):
-        value = parse_int(first_line(path))
-        if value is not None:
-            return f"{value / 1000:.0f} MHz"
-    value = cpuinfo_records()[0].get("cpu mhz") if cpuinfo_records() else None
-    number = parse_float(value)
-    return f"{number:.0f} MHz" if number is not None else UNKNOWN
-
-
-def cpu_affinity() -> str:
-    try:
-        values = sorted(os.sched_getaffinity(0))
-        return ",".join(str(value) for value in values) if values else UNKNOWN
-    except (AttributeError, OSError):
-        return UNKNOWN
-
-
-def cpu_topology() -> dict[str, str]:
-    record = cpuinfo_records()[0] if cpuinfo_records() else {}
-    values = {
-        "Physical CPUs": record.get("physical id"),
-        "Cores per socket": record.get("cpu cores"),
-        "Threads per core": record.get("siblings"),
-        "Flags": record.get("flags") or record.get("features"),
-    }
-    return {key: (value if value else UNKNOWN) for key, value in values.items()}
-
-
 def mounts() -> list[tuple[str, str, str, str]]:
-    result = []
-    content = read_text("/proc/mounts") or ""
-    for line in content.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            result.append((fields[0], fields[1], fields[2], fields[3]))
-    return result
+    out = []
+    for line in (read("/proc/mounts") or "").splitlines():
+        f = line.split()
+        if len(f) >= 4:
+            out.append((f[0], f[1], f[2], f[3]))
+    return out
 
 
 def cgroup_info() -> tuple[str, Path | None, dict[str, Path], str]:
-    unified: Path | None = None
+    unified = None
     controllers: dict[str, Path] = {}
-    for _, mount_point, fs_type, options in mounts():
-        if fs_type == "cgroup2":
-            unified = Path(mount_point)
-        elif fs_type == "cgroup":
-            for option in options.split(","):
-                if option not in {"rw", "ro", "relatime", "nosuid", "nodev", "noexec", "seclabel"} and not option.startswith("name="):
-                    controllers.setdefault(option, Path(mount_point))
-    content = read_text("/proc/self/cgroup") or ""
+    ignored = {"rw", "ro", "relatime", "nosuid", "nodev", "noexec", "seclabel"}
+    for _, mount, fs, opts in mounts():
+        if fs == "cgroup2":
+            unified = Path(mount)
+        elif fs == "cgroup":
+            for option in opts.split(","):
+                if option not in ignored and not option.startswith("name="):
+                    controllers.setdefault(option, Path(mount))
     relative = "/"
-    for line in content.splitlines():
-        fields = line.split(":", 2)
-        if len(fields) == 3 and fields[2]:
-            relative = fields[2]
+    for line in (read("/proc/self/cgroup") or "").splitlines():
+        f = line.split(":", 2)
+        if len(f) == 3 and f[2]:
+            relative = f[2]
             break
     version = "v2" if unified else ("v1" if controllers else UNKNOWN)
     return version, unified, controllers, relative
 
 
-def cgroup_read(names: tuple[str, ...], unified: Path | None, controllers: dict[str, Path], relative: str) -> str | None:
+def cg_read(names: tuple[str, ...], unified: Path | None, controllers: dict[str, Path], relative: str) -> str | None:
+    rel = relative.lstrip("/")
     for name in names:
         if unified:
-            value = first_line(unified / relative.lstrip("/") / name)
-            if value:
+            value = first(unified / rel / name)
+            if value is not None:
                 return value
         for mount in controllers.values():
-            value = first_line(mount / relative.lstrip("/") / name)
-            if value:
+            value = first(mount / rel / name)
+            if value is not None:
                 return value
     return None
 
 
-def cpu_allocation(unified: Path | None, controllers: dict[str, Path], relative: str) -> dict[str, Any]:
-    result: dict[str, Any] = {"quota": None, "period": None, "vcpu": None, "weight": None}
-    if unified:
-        raw = cgroup_read(("cpu.max",), unified, controllers, relative)
-        if raw:
-            fields = raw.split()
-            quota = fields[0] if fields else None
-            period = parse_int(fields[1]) if len(fields) > 1 else None
-            result.update(quota=quota, period=period)
-            quota_number = parse_int(quota) if quota not in {None, "max"} else None
-            if quota_number is not None and quota_number >= 0 and period and period > 0:
-                result["vcpu"] = quota_number / period
-        result["weight"] = cgroup_read(("cpu.weight",), unified, controllers, relative)
-    else:
-        quota = cgroup_read(("cpu.cfs_quota_us",), unified, controllers, relative)
-        period = cgroup_read(("cpu.cfs_period_us",), unified, controllers, relative)
-        result.update(quota=quota, period=parse_int(period))
-        quota_number = parse_int(quota)
-        period_number = parse_int(period)
-        if quota_number is not None and quota_number >= 0 and period_number and period_number > 0:
-            result["vcpu"] = quota_number / period_number
-        result["weight"] = cgroup_read(("cpu.shares",), unified, controllers, relative)
-    return result
+def parse_meminfo() -> dict[str, int]:
+    out = {}
+    for line in (read("/proc/meminfo") or "").splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        f = rest.split()
+        n = integer(f[0]) if f else None
+        if n is not None:
+            out[key] = n * 1024 if len(f) > 1 and f[1].lower() == "kb" else n
+    return out
 
 
-def detect_container(version: str, unified: Path | None) -> tuple[str, str, str]:
-    evidence: list[str] = []
-    if Path("/.dockerenv").is_file():
-        evidence.append("/.dockerenv")
-    if Path("/run/.containerenv").is_file():
-        evidence.append("/run/.containerenv")
-    for path in ("/proc/1/cgroup", "/proc/self/cgroup"):
-        marker = (read_text(path) or "").lower()
-        if any(token in marker for token in ("docker", "containerd", "kubepods", "libpod", "lxc")):
-            evidence.append(f"container marker in {path}")
-    if os.environ.get("KUBERNETES_SERVICE_HOST"):
-        evidence.append("KUBERNETES_SERVICE_HOST")
-    if os.environ.get("ECS_CONTAINER_METADATA_URI_V4") or os.environ.get("ECS_CONTAINER_METADATA_URI"):
-        evidence.append("ECS metadata environment variable")
-    if len(evidence) >= 2:
-        return "Yes", "HIGH", "; ".join(evidence)
-    if len(evidence) == 1:
-        return "Yes", "MEDIUM", evidence[0]
-    if version in {"v1", "v2"} and unified is not None:
-        return "Unknown / conflicting evidence", "LOW", "cgroup is exposed but no independent container marker"
+def provider() -> tuple[str, str, str]:
+    e = os.environ
+    if e.get("RENDER", "").lower() == "true" or e.get("RENDER_SERVICE_NAME") or e.get("RENDER_SERVICE_ID"):
+        return "Render", "HIGH", "explicit Render environment variables"
+    if e.get("AWS_EXECUTION_ENV", "").upper() == "AWS_ECS_FARGATE":
+        return "AWS ECS/Fargate", "HIGH", "AWS_EXECUTION_ENV=AWS_ECS_FARGATE"
+    if e.get("ECS_CONTAINER_METADATA_URI_V4") or e.get("ECS_CONTAINER_METADATA_URI"):
+        return "AWS ECS", "HIGH", "explicit ECS metadata environment variable"
+    if e.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return "AWS Lambda", "HIGH", "AWS_LAMBDA_FUNCTION_NAME"
+    if e.get("KUBERNETES_SERVICE_HOST"):
+        return "Kubernetes", "HIGH", "KUBERNETES_SERVICE_HOST"
+    if e.get("K_SERVICE") or e.get("K_REVISION"):
+        return "Google Cloud Run", "HIGH", "explicit Cloud Run environment variables"
+    if e.get("DYNO") or e.get("HEROKU_APP_NAME"):
+        return "Heroku", "HIGH", "explicit Heroku environment variables"
+    if e.get("VERCEL"):
+        return "Vercel", "HIGH", "VERCEL"
+    if e.get("RAILWAY_ENVIRONMENT"):
+        return "Railway", "HIGH", "RAILWAY_ENVIRONMENT"
+    if e.get("FLY_APP_NAME"):
+        return "Fly.io", "HIGH", "FLY_APP_NAME"
     return "Unknown", "UNKNOWN", UNKNOWN
 
 
-def detect_platform() -> str:
-    env = os.environ
-    if env.get("RENDER", "").lower() == "true" or any(env.get(k) for k in ("RENDER_SERVICE_NAME", "RENDER_SERVICE_ID")):
-        return "Render"
-    if env.get("K_SERVICE") or env.get("K_REVISION"):
-        return "Google Cloud Run"
-    if env.get("AWS_LAMBDA_FUNCTION_NAME"):
-        return "AWS Lambda"
-    if env.get("DYNO") or env.get("HEROKU_APP_NAME"):
-        return "Heroku"
-    if env.get("VERCEL"):
-        return "Vercel"
-    if env.get("RAILWAY_ENVIRONMENT"):
-        return "Railway"
-    if env.get("FLY_APP_NAME"):
-        return "Fly.io"
-    if env.get("GITHUB_ACTIONS"):
-        return "GitHub Actions"
-    if env.get("CODEBUILD_BUILD_ARN"):
-        return "AWS CodeBuild"
-    return "Unknown"
+def container(version: str, unified: Path | None) -> tuple[str, str, str]:
+    evidence: list[str] = []
+    if Path("/.dockerenv").is_file(): evidence.append("/.dockerenv")
+    if Path("/run/.containerenv").is_file(): evidence.append("/run/.containerenv")
+    for p in ("/proc/1/cgroup", "/proc/self/cgroup"):
+        text = (read(p) or "").lower()
+        if any(x in text for x in ("docker", "containerd", "kubepods", "libpod", "lxc")):
+            evidence.append(f"container marker in {p}")
+    if os.environ.get("KUBERNETES_SERVICE_HOST"): evidence.append("KUBERNETES_SERVICE_HOST")
+    if os.environ.get("ECS_CONTAINER_METADATA_URI_V4") or os.environ.get("ECS_CONTAINER_METADATA_URI"): evidence.append("ECS metadata environment variable")
+    if len(evidence) >= 2: return "Yes", "HIGH", "; ".join(evidence)
+    if len(evidence) == 1: return "Yes", "MEDIUM", evidence[0]
+    if version in {"v1", "v2"} and unified: return "Unknown / conflicting evidence", "LOW", "cgroup exposed but no independent container marker"
+    return "Unknown", "UNKNOWN", UNKNOWN
 
 
-def root_filesystem() -> dict[str, Any]:
-    result: dict[str, Any] = {"total": None, "used": None, "free": None, "type": UNKNOWN, "mount": UNKNOWN, "options": UNKNOWN, "readonly": UNKNOWN, "inodes_total": None, "inodes_used": None, "inodes_free": None}
-    try:
-        usage = shutil.disk_usage("/")
-        result.update(total=usage.total, used=usage.used, free=usage.free)
-    except (OSError, ValueError):
-        pass
-    try:
-        stats = os.statvfs("/")
-        total_inodes = stats.f_files
-        free_inodes = stats.f_ffree
-        result.update(inodes_total=total_inodes, inodes_free=free_inodes, inodes_used=total_inodes - free_inodes)
-    except (OSError, ValueError):
-        pass
-    for source, mount, fs_type, options in mounts():
-        if mount == "/":
-            result.update(type=fs_type or UNKNOWN, mount=f"{source} on {mount}", options=options or UNKNOWN, readonly="Yes" if "ro" in options.split(",") else "No")
-            break
-    return result
+def virtualization() -> tuple[str, str, str]:
+    product = first("/sys/class/dmi/id/product_name") or ""
+    vendor = first("/sys/class/dmi/id/sys_vendor") or ""
+    marker = f"{product} {vendor}".lower()
+    if Path("/.dockerenv").is_file() or Path("/run/.containerenv").is_file(): return "Container", "HIGH", "container marker file"
+    if any(x in marker for x in ("kvm", "qemu", "virtualbox", "vmware", "microsoft corporation")):
+        return "Virtual machine", "MEDIUM", f"DMI product/vendor: {product or vendor}"
+    if marker: return "Unknown", "LOW", f"DMI product/vendor: {product or vendor}"
+    return UNKNOWN, "UNKNOWN", UNKNOWN
 
 
-def process_limits() -> dict[str, str]:
-    result = {"open_files": UNKNOWN, "processes": UNKNOWN}
-    content = read_text("/proc/self/limits") or ""
-    for line in content.splitlines():
-        fields = line.split()
-        if line.startswith("Max open files") and len(fields) >= 4:
-            result["open_files"] = f"{fields[3]} soft / {fields[4] if len(fields) > 4 else UNKNOWN} hard"
-        elif line.startswith("Max processes") and len(fields) >= 4:
-            result["processes"] = f"{fields[2]} soft / {fields[3] if len(fields) > 3 else UNKNOWN} hard"
-    return result
-
-
-def network_interfaces() -> list[str]:
-    result = []
-    try:
-        names = sorted(name for _, name in socket.if_nameindex())
-    except (OSError, AttributeError):
-        try:
-            names = sorted(os.listdir("/sys/class/net"))
-        except OSError:
-            names = []
-    for name in names:
-        address = first_line(f"/sys/class/net/{name}/address") or UNKNOWN
-        state = first_line(f"/sys/class/net/{name}/operstate") or UNKNOWN
-        result.append(f"{name} (state={state}, MAC={address})")
-    return result
-
-
-def safe_environment() -> list[str]:
-    result = []
-    try:
-        items = os.environ.items()
-    except Exception:
-        return result
-    for name, value in sorted(items):
-        if name not in SAFE_ENVIRONMENT_NAMES or SECRET_NAME_RE.search(name):
+def env_values() -> list[str]:
+    out = []
+    for name, value in sorted(os.environ.items()):
+        if name not in SAFE_ENV_NAMES or SECRET_RE.search(name):
             continue
-        safe_value = value[:197] + "..." if len(value) > 200 else value
-        result.append(f"{name}={safe_value}")
-    return result
+        out.append(f"{name}={value[:197] + '...' if len(value) > 200 else value}")
+    return out
+
+
+def item(label: str, value: Any) -> None:
+    if value is None or value == "": value = UNKNOWN
+    print(f"{label:<34} {value}")
 
 
 def section(title: str) -> None:
     print(f"\n{'=' * 16} {title} {'=' * 16}")
 
 
-def item(label: str, value: Any) -> None:
-    if value is None or value == "":
-        value = UNKNOWN
-    print(f"{label:<34} {value}")
+def collect() -> None:
+    print("SYSTEM CONFIGURATION INSPECTOR")
+    print("Read-only inspection using Python standard library; no external network calls.")
+    cg = safe(cgroup_info, (UNKNOWN, None, {}, "/"))
+    version, unified, controllers, relative = cg
 
-
-def namespace_info() -> dict[str, str]:
-    names = ("pid", "mnt", "net", "ipc", "uts", "user", "cgroup")
-    result: dict[str, str] = {}
-    for name in names:
-        try:
-            target = os.readlink(f"/proc/self/ns/{name}")
-            result[name] = target
-        except (FileNotFoundError, PermissionError, OSError):
-            result[name] = UNKNOWN
-    return result
-
-
-def virtualization_info() -> tuple[str, str, str]:
-    product = first_line("/sys/class/dmi/id/product_name") or ""
-    vendor = first_line("/sys/class/dmi/id/sys_vendor") or ""
-    marker = (product + " " + vendor).lower()
-    if Path("/.dockerenv").is_file() or Path("/run/.containerenv").is_file():
-        return "Container", "HIGH", "container marker file"
-    if any(value in marker for value in ("kvm", "qemu", "virtualbox", "vmware", "microsoft corporation")):
-        return "Virtual machine", "MEDIUM", f"DMI product/vendor: {product or vendor}"
-    if marker:
-        return "Unknown", "LOW", f"DMI product/vendor: {product or vendor}"
-    return UNKNOWN, "UNKNOWN", UNKNOWN
-
-
-def provider_evidence() -> tuple[str, str, str]:
-    env = os.environ
-    if env.get("RENDER", "").lower() == "true" or any(env.get(k) for k in ("RENDER_SERVICE_NAME", "RENDER_SERVICE_ID")):
-        return "Render", "HIGH", "explicit Render environment variables"
-    if env.get("AWS_EXECUTION_ENV", "").upper() == "AWS_ECS_FARGATE":
-        return "AWS ECS/Fargate", "HIGH", "AWS_EXECUTION_ENV=AWS_ECS_FARGATE"
-    if env.get("ECS_CONTAINER_METADATA_URI_V4") or env.get("ECS_CONTAINER_METADATA_URI"):
-        return "AWS ECS", "HIGH", "explicit ECS metadata environment variable"
-    if env.get("AWS_LAMBDA_FUNCTION_NAME"):
-        return "AWS Lambda", "HIGH", "AWS_LAMBDA_FUNCTION_NAME"
-    if env.get("KUBERNETES_SERVICE_HOST"):
-        return "Kubernetes", "HIGH", "KUBERNETES_SERVICE_HOST"
-    if env.get("K_SERVICE") or env.get("K_REVISION"):
-        return "Google Cloud Run", "HIGH", "explicit Cloud Run environment variables"
-    if env.get("DYNO") or env.get("HEROKU_APP_NAME"):
-        return "Heroku", "HIGH", "explicit Heroku environment variables"
-    if env.get("VERCEL"):
-        return "Vercel", "HIGH", "VERCEL"
-    if env.get("RAILWAY_ENVIRONMENT"):
-        return "Railway", "HIGH", "RAILWAY_ENVIRONMENT"
-    if env.get("FLY_APP_NAME"):
-        return "Fly.io", "HIGH", "FLY_APP_NAME"
-    return "Unknown", "UNKNOWN", UNKNOWN
-
-
-def security_info() -> dict[str, str]:
-    result = {
-        "Root status": "Yes" if safe_call(os.geteuid, -1) == 0 else "No" if safe_call(os.geteuid, -1) >= 0 else UNKNOWN,
-        "Capabilities": UNKNOWN,
-        "No new privileges": UNKNOWN,
-        "Seccomp": UNKNOWN,
-        "AppArmor": UNKNOWN,
-        "SELinux": UNKNOWN,
-    }
-    status = read_kv_file("/proc/self/status", separator=":")
-    if status.get("CapEff"):
-        result["Capabilities"] = status["CapEff"]
-    if status.get("NoNewPrivs"):
-        result["No new privileges"] = status["NoNewPrivs"]
-    if status.get("Seccomp"):
-        result["Seccomp"] = status["Seccomp"]
-    if Path("/sys/kernel/security/apparmor").exists():
-        result["AppArmor"] = "Present"
-    if Path("/sys/fs/selinux").exists():
-        result["SELinux"] = "Present"
-    return result
-
-
-def local_network_info() -> dict[str, str]:
-    result = {"Routes": UNKNOWN, "Default route": UNKNOWN, "DNS configuration": UNKNOWN, "Hosts file": UNKNOWN}
-    routes = read_text("/proc/net/route")
-    if routes:
-        route_lines = [line for line in routes.splitlines()[1:] if line.strip()]
-        result["Routes"] = f"{len(route_lines)} visible route(s)"
-        for line in route_lines:
-            fields = line.split()
-            if len(fields) >= 2 and fields[1] == "00000000":
-                result["Default route"] = f"interface {fields[0]}"
-                break
-    resolv = read_text("/etc/resolv.conf")
-    if resolv:
-        servers = [line.split()[1] for line in resolv.splitlines() if line.startswith("nameserver ") and len(line.split()) > 1]
-        result["DNS configuration"] = f"{len(servers)} nameserver(s) configured" if servers else UNKNOWN
-    hosts = read_text("/etc/hosts")
-    if hosts:
-        result["Hosts file"] = f"{len([line for line in hosts.splitlines() if line.strip() and not line.lstrip().startswith('#')])} entries visible"
-    return result
-
-
-def rlimit_info() -> dict[str, str]:
-    names = {
-        "Open files": resource.RLIMIT_NOFILE,
-        "Processes": getattr(resource, "RLIMIT_NPROC", None),
-        "Stack": resource.RLIMIT_STACK,
-        "Core dump": resource.RLIMIT_CORE,
-        "Address space": resource.RLIMIT_AS,
-        "Locked memory": resource.RLIMIT_MEMLOCK,
-        "File size": resource.RLIMIT_FSIZE,
-    }
-    result: dict[str, str] = {}
-    for label, constant in names.items():
-        if constant is None:
-            result[label] = UNKNOWN
-            continue
-        try:
-            soft, hard = resource.getrlimit(constant)
-            def limit(value: int) -> str:
-                return "Unlimited" if value == resource.RLIM_INFINITY else str(value)
-            result[label] = f"{limit(soft)} soft / {limit(hard)} hard"
-        except (ValueError, OSError):
-            result[label] = UNKNOWN
-    return result
-
-
-def collect_system() -> None:
     section("SYSTEM")
-    values = read_kv_file("/etc/os-release")
-    item("OS", safe_call(platform.system))
-    item("Linux distribution", values.get("PRETTY_NAME") or values.get("NAME") or UNKNOWN)
-    item("Distribution version", values.get("VERSION_ID") or values.get("VERSION") or UNKNOWN)
-    item("Kernel version", safe_call(platform.version))
-    item("Kernel release", safe_call(platform.release))
-    item("Kernel build", safe_call(platform.platform))
-    item("Machine architecture", safe_call(platform.machine))
-    item("CPU architecture", safe_call(lambda: platform.uname().machine))
-    item("Hostname", safe_call(socket.gethostname))
-    item("Uptime", safe_call(format_uptime))
-    uptime_seconds = parse_float(first_line("/proc/uptime").split()[0]) if first_line("/proc/uptime") else None
-    boot = time.time() - uptime_seconds if uptime_seconds is not None else None
-    item("Boot time", datetime.datetime.fromtimestamp(boot).isoformat() if boot is not None else UNKNOWN)
-    item("Timezone", safe_call(lambda: time.tzname[0]))
-    item("Locale", safe_call(lambda: locale.setlocale(locale.LC_ALL)))
-    virtualization, confidence, evidence = safe_call(virtualization_info, (UNKNOWN, "UNKNOWN", UNKNOWN))
-    item("Virtualization", f"{virtualization} (confidence={confidence}; evidence={evidence})")
-    item("Init system", first_line("/proc/1/comm") or UNKNOWN)
-    item("systemd presence", "Present" if Path("/run/systemd/system").exists() else "Not detected")
-    item("Root filesystem", "/" if Path("/").exists() else UNKNOWN)
-    item("Current user", safe_call(getpass.getuser))
-    item("Shell", os.environ.get("SHELL", UNKNOWN))
+    os_release = {}
+    for line in (read("/etc/os-release") or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1); os_release[k] = v.strip().strip('"')
+    item("OS", platform.system())
+    item("Linux distribution", os_release.get("PRETTY_NAME") or os_release.get("NAME"))
+    item("Distribution version", os_release.get("VERSION_ID") or os_release.get("VERSION"))
+    item("Kernel version", platform.version()); item("Kernel release", platform.release()); item("Kernel build", platform.platform())
+    item("Machine architecture", platform.machine()); item("CPU architecture", platform.uname().machine); item("Hostname", socket.gethostname())
+    uptime = number((first("/proc/uptime") or "").split()[0])
+    item("Uptime", f"{int(uptime // 86400)}d {int(uptime % 86400 // 3600)}h {int(uptime % 3600 // 60)}m {int(uptime % 60)}s" if uptime is not None else UNKNOWN)
+    item("Boot time", datetime.datetime.fromtimestamp(time.time() - uptime).isoformat() if uptime is not None else UNKNOWN)
+    item("Timezone", time.tzname[0]); item("Locale", safe(lambda: locale.setlocale(locale.LC_ALL)))
+    v, conf, ev = safe(virtualization, (UNKNOWN, "UNKNOWN", UNKNOWN)); item("Virtualization", f"{v} (confidence={conf}; evidence={ev})")
+    item("Init system", first("/proc/1/comm")); item("systemd presence", "Present" if Path("/run/systemd/system").exists() else "Not detected")
+    item("Root filesystem", "/"); item("Current user", safe(getpass.getuser)); item("Shell", os.environ.get("SHELL", UNKNOWN))
 
-
-def collect_cpu(cgroup: tuple[str, Path | None, dict[str, Path], str]) -> None:
     section("CPU")
-    _, unified, controllers, relative = cgroup
-    allocation = safe_call(lambda: cpu_allocation(unified, controllers, relative), {})
-    topology = safe_call(cpu_topology, {})
-    visible = safe_call(os.cpu_count)
-    online = safe_call(online_cpu_count)
-    item("CPU model", safe_call(cpu_model))
-    item("CPU vendor", safe_call(cpu_vendor))
-    item("Visible logical CPUs", visible)
-    item("Online CPU count", online)
-    item("Offline CPU count", online is not None and visible is not None and max(0, visible - online) or UNKNOWN)
-    item("CPU architecture", safe_call(platform.machine))
-    item("Physical CPU count", topology.get("Physical CPUs", UNKNOWN))
-    item("Cores per socket", topology.get("Cores per socket", UNKNOWN))
-    item("Threads per core", topology.get("Threads per core", UNKNOWN))
-    item("CPU frequency", safe_call(cpu_frequency))
-    item("CPU flags", topology.get("Flags", UNKNOWN))
-    item("CPU affinity", safe_call(cpu_affinity))
-    quota = allocation.get("quota") if isinstance(allocation, dict) else None
-    period = allocation.get("period") if isinstance(allocation, dict) else None
-    item("CPU quota", UNLIMITED if quota in {"max", "-1"} else (f"{quota} µs" if quota is not None else UNKNOWN))
-    item("CPU period", f"{period} µs" if period else UNKNOWN)
-    vcpu = allocation.get("vcpu") if isinstance(allocation, dict) else None
-    item("Allocated CPU", f"{vcpu:.2f} vCPU" if isinstance(vcpu, float) else (UNLIMITED if quota in {"max", "-1"} else UNKNOWN))
-    item("CPU weight / shares", allocation.get("weight") if isinstance(allocation, dict) else UNKNOWN)
-    cpuset = cgroup_read(("cpuset.cpus.effective", "cpuset.cpus"), unified, controllers, relative)
-    item("Effective CPU set", cpuset or UNKNOWN)
-    provider_cpu = os.environ.get("RENDER_CPU_COUNT")
-    item("Provider-reported CPU allocation", f"{provider_cpu} vCPU (Render)" if provider_cpu else UNKNOWN)
+    records = cpu_records(); rec = records[0] if records else {}
+    model = rec.get("model name") or rec.get("hardware") or rec.get("cpu model")
+    if not model or model.isdigit(): model = safe(platform.processor)
+    if not model or str(model).isdigit(): model = UNKNOWN
+    vendor = rec.get("vendor_id") or rec.get("vendor") or rec.get("cpu implementer") or UNKNOWN
+    visible = safe(os.cpu_count); online_raw = first("/sys/devices/system/cpu/online"); online_set = cpu_set(online_raw)
+    online = len(online_set) if online_set else visible
+    offline = max(0, visible - online) if isinstance(visible, int) and isinstance(online, int) else UNKNOWN
+    physical_ids = {r.get("physical id") for r in records if r.get("physical id")}
+    item("CPU model", model); item("CPU vendor", vendor); item("Visible logical CPUs", visible); item("Online CPU count", online); item("Offline CPU count", offline)
+    item("CPU architecture", platform.machine()); item("Physical CPU count", len(physical_ids) if physical_ids else UNKNOWN)
+    item("Cores per socket", rec.get("cpu cores") or UNKNOWN); item("Threads per core", rec.get("siblings") or UNKNOWN)
+    mhz = number(rec.get("cpu mhz")); item("CPU frequency", f"{mhz:.0f} MHz" if mhz is not None else UNKNOWN)
+    item("CPU flags", rec.get("flags") or rec.get("features") or UNKNOWN)
+    try: affinity = ",".join(map(str, sorted(os.sched_getaffinity(0))))
+    except (AttributeError, OSError): affinity = UNKNOWN
+    item("CPU affinity", affinity)
+    if version == "v2": raw = cg_read(("cpu.max",), unified, controllers, relative); weight = cg_read(("cpu.weight",), unified, controllers, relative)
+    else: raw = cg_read(("cpu.cfs_quota_us",), unified, controllers, relative); weight = cg_read(("cpu.shares",), unified, controllers, relative)
+    if version == "v2" and raw:
+        f = raw.split(); quota = f[0] if f else None; period = integer(f[1]) if len(f) > 1 else None
+    else: quota = raw; period = integer(cg_read(("cpu.cfs_period_us",), unified, controllers, relative))
+    item("CPU quota", UNLIMITED if quota in {"max", "-1"} else (f"{quota} µs" if quota else UNKNOWN)); item("CPU period", f"{period} µs" if period else UNKNOWN)
+    qn = integer(quota); vcpu = qn / period if qn is not None and qn >= 0 and period else None
+    item("Allocated CPU", f"{vcpu:.2f} vCPU" if vcpu is not None else (UNLIMITED if quota in {"max", "-1"} else UNKNOWN)); item("CPU weight / shares", weight or UNKNOWN)
+    item("Effective CPU set", cg_read(("cpuset.cpus.effective", "cpuset.cpus"), unified, controllers, relative) or UNKNOWN)
+    render_cpu = os.environ.get("RENDER_CPU_COUNT"); item("Provider-reported CPU allocation", f"{render_cpu} vCPU (Render)" if render_cpu else UNKNOWN)
 
-
-def collect_memory(cgroup: tuple[str, Path | None, dict[str, Path], str]) -> None:
     section("MEMORY")
-    _, unified, controllers, relative = cgroup
-    mem = safe_call(parse_meminfo, {})
-    total = mem.get("MemTotal")
-    available = mem.get("MemAvailable")
-    swap_total = mem.get("SwapTotal")
-    swap_free = mem.get("SwapFree")
-    item("Host-visible memory", format_bytes(total))
-    item("Available memory", format_bytes(available))
-    item("Used visible memory", format_bytes(total - available if total is not None and available is not None else None))
-    item("Free memory", format_bytes(mem.get("MemFree")))
-    item("Buffers", format_bytes(mem.get("Buffers")))
-    item("Cached", format_bytes(mem.get("Cached")))
-    item("Memory allocation / limit", format_limit(cgroup_read(("memory.max", "memory.limit_in_bytes"), unified, controllers, relative)))
-    item("Memory max", format_limit(cgroup_read(("memory.max", "memory.limit_in_bytes"), unified, controllers, relative)))
-    item("cgroup memory current", format_bytes(parse_limit(cgroup_read(("memory.current", "memory.usage_in_bytes"), unified, controllers, relative))))
-    item("cgroup memory high", format_limit(cgroup_read(("memory.high",), unified, controllers, relative)))
-    item("cgroup memory swap max", format_limit(cgroup_read(("memory.swap.max", "memory.memsw.limit_in_bytes"), unified, controllers, relative)))
-    item("Swap total", format_bytes(swap_total))
-    item("Swap free", format_bytes(swap_free))
-    item("Swap used", format_bytes(swap_total - swap_free if swap_total is not None and swap_free is not None else None))
-    pressure = read_text("/proc/pressure/memory")
-    item("Memory pressure", pressure.replace("\\n", "; ") if pressure else UNKNOWN)
-    events = cgroup_read(("memory.events",), unified, controllers, relative)
-    item("cgroup memory events", events or UNKNOWN)
+    mem = parse_meminfo(); total = mem.get("MemTotal"); avail = mem.get("MemAvailable"); swap_total = mem.get("SwapTotal"); swap_free = mem.get("SwapFree")
+    item("Host-visible memory", bytes_text(total)); item("Available memory", bytes_text(avail)); item("Used visible memory", bytes_text(total-avail if total is not None and avail is not None else None)); item("Free memory", bytes_text(mem.get("MemFree")))
+    item("Buffers", bytes_text(mem.get("Buffers"))); item("Cached", bytes_text(mem.get("Cached")))
+    mem_limit = cg_read(("memory.max", "memory.limit_in_bytes"), unified, controllers, relative); item("Memory allocation / limit", limit_text(mem_limit)); item("Memory max", limit_text(mem_limit))
+    cur = cg_read(("memory.current", "memory.usage_in_bytes"), unified, controllers, relative); item("cgroup memory current", bytes_text(integer(cur))); item("cgroup memory high", limit_text(cg_read(("memory.high",), unified, controllers, relative)))
+    item("cgroup memory swap max", limit_text(cg_read(("memory.swap.max", "memory.memsw.limit_in_bytes"), unified, controllers, relative))); item("Swap total", bytes_text(swap_total)); item("Swap free", bytes_text(swap_free)); item("Swap used", bytes_text(swap_total-swap_free if swap_total is not None and swap_free is not None else None))
+    item("Memory pressure", (read("/proc/pressure/memory") or UNKNOWN).replace("\n", "; ")); item("cgroup memory events", (read("/sys/fs/cgroup/memory.events") or UNKNOWN).replace("\n", "; "))
 
-
-def collect_storage() -> None:
     section("STORAGE")
-    fs = safe_call(root_filesystem, {})
-    item("Visible root filesystem total", format_bytes(fs.get("total")))
-    item("Visible root filesystem used", format_bytes(fs.get("used")))
-    item("Visible root filesystem free", format_bytes(fs.get("free")))
-    item("Filesystem type", fs.get("type", UNKNOWN))
-    item("Mount point/source", fs.get("mount", UNKNOWN))
-    item("Mount options", fs.get("options", UNKNOWN))
-    item("Read-only filesystem", fs.get("readonly", UNKNOWN))
-    item("Inodes total", fs.get("inodes_total", UNKNOWN))
-    item("Inodes used", fs.get("inodes_used", UNKNOWN))
-    item("Inodes free", fs.get("inodes_free", UNKNOWN))
-    writable = safe_call(lambda: os.access("/", os.W_OK), None)
-    item("Root filesystem writable", "Yes" if writable is True else "No" if writable is False else UNKNOWN)
-    item("Filesystem list", "; ".join(f"{fs_type}:{mount}" for _, mount, fs_type, _ in mounts()[:20]) or UNKNOWN)
-    item("Block devices", "; ".join(sorted(os.listdir("/sys/class/block"))) if safe_call(lambda: Path("/sys/class/block").exists(), False) else UNKNOWN)
-    item("Provider-reported disk allocation", UNKNOWN)
+    try: du = shutil.disk_usage("/"); total_d, used_d, free_d = du.total, du.used, du.free
+    except OSError: total_d = used_d = free_d = None
+    item("Visible root filesystem total", bytes_text(total_d)); item("Visible root filesystem used", bytes_text(used_d)); item("Visible root filesystem free", bytes_text(free_d))
+    root = next((x for x in mounts() if x[1] == "/"), None); item("Filesystem type", root[2] if root else UNKNOWN); item("Mount point/source", f"{root[0]} on /" if root else UNKNOWN); item("Mount options", root[3] if root else UNKNOWN); item("Read-only filesystem", "Yes" if root and "ro" in root[3].split(",") else "No" if root else UNKNOWN)
+    try: st = os.statvfs("/"); item("Inodes total", st.f_files); item("Inodes used", st.f_files-st.f_ffree); item("Inodes free", st.f_ffree)
+    except OSError: item("Inodes total", UNKNOWN); item("Inodes used", UNKNOWN); item("Inodes free", UNKNOWN)
+    item("Root filesystem writable", "Yes" if safe(lambda: os.access("/", os.W_OK), False) else "No")
+    item("Filesystem list", "; ".join(f"{fs}:{mnt}" for _, mnt, fs, _ in mounts()[:30]) or UNKNOWN); item("Block devices", "; ".join(sorted(os.listdir("/sys/class/block"))) if Path("/sys/class/block").exists() else UNKNOWN); item("Provider-reported disk allocation", UNKNOWN)
 
-
-def collect_container(cgroup: tuple[str, Path | None, dict[str, Path], str]) -> None:
     section("CONTAINER / CGROUP")
-    version, unified, controllers, relative = cgroup
-    detected, confidence, evidence = safe_call(lambda: detect_container(version, unified), (UNKNOWN, "UNKNOWN", UNKNOWN))
-    item("Container", detected)
-    item("Confidence", confidence)
-    item("Evidence", evidence)
-    item("cgroup version", version)
-    item("cgroup path", relative)
-    item("Exposed controllers", ", ".join(sorted(controllers)) if controllers else (first_line(unified / "cgroup.controllers") if unified else UNKNOWN))
-    item("PID limit", format_count_limit(cgroup_read(("pids.max",), unified, controllers, relative)))
-    item("PID current", cgroup_read(("pids.current",), unified, controllers, relative) or UNKNOWN)
-    item("I/O limit information", cgroup_read(("io.max", "blkio.throttle.read_bps_device"), unified, controllers, relative) or UNKNOWN)
+    c, cc, ce = container(version, unified); item("Container", c); item("Confidence", cc); item("Evidence", ce); item("cgroup version", version); item("cgroup path", relative)
+    item("Exposed controllers", ", ".join(sorted(controllers)) if version == "v1" else (first(unified / "cgroup.controllers") if unified else UNKNOWN))
+    item("PID limit", limit_text(cg_read(("pids.max",), unified, controllers, relative), True)); item("PID current", cg_read(("pids.current",), unified, controllers, relative) or UNKNOWN)
+    io_max = read((unified / relative.lstrip("/") / "io.max") if unified else "") if version == "v2" else None; item("I/O limit information", (io_max or UNKNOWN).replace("\n", "; "))
 
-
-def collect_process() -> None:
-    section("PROCESS")
-    pid = safe_call(os.getpid)
-    item("Current PID", pid)
-    item("Parent PID", safe_call(os.getppid))
-    item("Process name", first_line("/proc/self/comm") or UNKNOWN)
-    item("Executable", safe_call(lambda: os.readlink("/proc/self/exe")))
-    command_line = read_text("/proc/self/cmdline")
-    item("Command line", command_line.replace("\x00", " ").strip() if command_line else UNKNOWN)
-    item("Effective UID", safe_call(os.geteuid) if hasattr(os, "geteuid") else UNKNOWN)
-    item("Effective GID", safe_call(os.getegid) if hasattr(os, "getegid") else UNKNOWN)
-    item("Username", safe_call(getpass.getuser))
-    item("Groups", safe_call(lambda: ",".join(str(group) for group in os.getgroups())))
-    status = read_kv_file("/proc/self/status", separator=":")
-    item("Thread count", status.get("Threads", UNKNOWN))
-    limits = safe_call(process_limits, {})
-    item("Open-file limits", limits.get("open_files", UNKNOWN))
-    item("Process/PID limits", limits.get("processes", UNKNOWN))
-    item("Current process status", status.get("State", UNKNOWN))
-
-
-def collect_namespaces() -> None:
     section("NAMESPACES")
-    values = safe_call(namespace_info, {})
-    for name in ("pid", "mnt", "net", "ipc", "uts", "user", "cgroup"):
-        item(f"{name} namespace", values.get(name, UNKNOWN))
+    for name in ("pid", "mnt", "net", "ipc", "uts", "user", "cgroup"): item(f"{name} namespace", safe(lambda n=name: os.readlink(f"/proc/self/ns/{n}")))
 
+    section("PROCESS")
+    status = {}
+    for line in (read("/proc/self/status") or "").splitlines():
+        if ":" in line: k, v0 = line.split(":", 1); status[k] = v0.strip()
+    item("Current PID", os.getpid()); stat = (first("/proc/self/stat") or "").split(); item("Parent PID", integer(stat[3]) if len(stat) > 3 else UNKNOWN); item("Process name", status.get("Name")); item("Executable", safe(lambda: os.readlink("/proc/self/exe"))); item("Command line", " ".join((read("/proc/self/cmdline") or "").split("\0")[:-1]) or UNKNOWN)
+    item("Effective UID", os.geteuid()); item("Effective GID", os.getegid()); item("Username", safe(getpass.getuser)); item("Groups", os.getgroups()); item("Thread count", status.get("Threads"))
+    limits = read("/proc/self/limits") or ""; nofile = next((x for x in limits.splitlines() if x.startswith("Max open files")), None); nproc = next((x for x in limits.splitlines() if x.startswith("Max processes")), None); item("Open-file limits", " ".join(nofile.split()[3:5]) if nofile else UNKNOWN); item("Process/PID limits", " ".join(nproc.split()[2:4]) if nproc else UNKNOWN); item("Current process status", status.get("State"))
 
-def collect_resource_limits() -> None:
-    section("RESOURCE LIMITS")
-    values = safe_call(rlimit_info, {})
-    for name in ("Open files", "Processes", "Stack", "Core dump", "Locked memory", "Address space", "File size"):
-        item(f"{name} process limit", values.get(name, UNKNOWN))
-
-
-def collect_network() -> None:
     section("NETWORK")
-    item("Hostname", safe_call(socket.gethostname))
-    interfaces = safe_call(network_interfaces, [])
-    item("Interfaces", "; ".join(interfaces) if interfaces else UNKNOWN)
-    local = safe_call(local_network_info, {})
-    item("Routes", local.get("Routes", UNKNOWN))
-    item("Default route", local.get("Default route", UNKNOWN))
-    item("DNS configuration", local.get("DNS configuration", UNKNOWN))
-    item("/etc/hosts", local.get("Hosts file", UNKNOWN))
-    item("IPv4/IPv6 addresses", "Not queried; no DNS or external network requests performed")
+    item("Hostname", socket.gethostname()); interfaces=[]
+    try: names=[n for _, n in socket.if_nameindex()]
+    except OSError: names=[]
+    for n in sorted(names): interfaces.append(f"{n} (state={first(f'/sys/class/net/{n}/operstate') or UNKNOWN}, MAC={first(f'/sys/class/net/{n}/address') or UNKNOWN}, MTU={first(f'/sys/class/net/{n}/mtu') or UNKNOWN})")
+    item("Interfaces", "; ".join(interfaces) or UNKNOWN)
+    route_lines=[x for x in (read("/proc/net/route") or "").splitlines()[1:] if x.strip()]; item("Routes", f"{len(route_lines)} visible route(s)"); default=next((x.split()[0] for x in route_lines if len(x.split()) > 1 and x.split()[1] == "00000000"), None); item("Default route", f"interface {default}" if default else UNKNOWN)
+    dns=[x.split()[1] for x in (read("/etc/resolv.conf") or "").splitlines() if x.startswith("nameserver ") and len(x.split()) > 1]; item("DNS configuration", f"{len(dns)} nameserver(s) configured" if dns else UNKNOWN); hosts=[x for x in (read("/etc/hosts") or "").splitlines() if x.strip() and not x.lstrip().startswith("#")]; item("/etc/hosts", f"{len(hosts)} entries visible"); item("IPv4/IPv6 addresses", UNKNOWN + " (local address enumeration not implemented; no external requests)")
 
-
-def collect_runtime() -> None:
     section("RUNTIME")
-    item("Python version", safe_call(platform.python_version))
-    item("Python implementation", safe_call(platform.python_implementation))
-    item("Python executable", safe_call(lambda: sys.executable))
-    item("Python architecture", safe_call(lambda: platform.architecture()[0]))
-    item("Python compiler", safe_call(platform.python_compiler))
-    item("Python build", safe_call(lambda: " ".join(platform.python_build())))
-    item("Current working directory", safe_call(os.getcwd))
-    item("Python prefix", safe_call(lambda: sys.prefix))
-    item("Python base prefix", safe_call(lambda: sys.base_prefix))
-    item("Virtual environment", "Yes" if safe_call(lambda: sys.prefix != sys.base_prefix, False) else "No")
-    item("Site packages", "; ".join(safe_call(site.getsitepackages, [])) or UNKNOWN)
-    item("sys.path entries", str(len(sys.path)))
+    item("Python version", platform.python_version()); item("Python implementation", platform.python_implementation()); item("Python executable", sys.executable); item("Python architecture", platform.architecture()[0]); item("Python compiler", platform.python_compiler()); item("Python build", " ".join(platform.python_build())); item("Current working directory", os.getcwd()); item("Python prefix", sys.prefix); item("Python base prefix", sys.base_prefix); item("Virtual environment", "Yes" if sys.prefix != sys.base_prefix else "No"); item("Site packages", "; ".join(safe(site.getsitepackages, [])) or UNKNOWN); item("sys.path entries", len(sys.path))
 
-
-def collect_resource_allocation(cgroup: tuple[str, Path | None, dict[str, Path], str]) -> None:
     section("RESOURCE ALLOCATION")
-    version, unified, controllers, relative = cgroup
-    allocation = safe_call(lambda: cpu_allocation(unified, controllers, relative), {})
-    vcpu = allocation.get("vcpu") if isinstance(allocation, dict) else None
-    item("Allocated CPU", f"{vcpu:.2f} vCPU" if isinstance(vcpu, float) else (UNLIMITED if allocation.get("quota") in {"max", "-1"} else UNKNOWN))
-    item("Memory allocation / limit", format_limit(cgroup_read(("memory.max", "memory.limit_in_bytes"), unified, controllers, relative)))
-    item("PID allocation / limit", format_count_limit(cgroup_read(("pids.max",), unified, controllers, relative)))
-    item("Allocation source", f"cgroup {version}" if version in {"v1", "v2"} else UNKNOWN)
+    item("Allocated CPU", f"{vcpu:.2f} vCPU" if vcpu is not None else (UNLIMITED if quota in {"max", "-1"} else UNKNOWN)); item("Memory allocation / limit", limit_text(mem_limit)); item("PID allocation / limit", limit_text(cg_read(("pids.max",), unified, controllers, relative), True)); item("Allocation source", f"cgroup {version}")
 
-
-def collect_virtualization() -> None:
-    section("VIRTUALIZATION")
-    value, confidence, evidence = safe_call(virtualization_info, (UNKNOWN, "UNKNOWN", UNKNOWN))
-    item("Virtualization", value)
-    item("Confidence", confidence)
-    item("Evidence", evidence)
-
-
-def collect_security() -> None:
-    section("SECURITY")
-    values = safe_call(security_info, {})
-    for name in ("Root status", "Capabilities", "No new privileges", "Seccomp", "AppArmor", "SELinux"):
-        item(name, values.get(name, UNKNOWN))
-    item("Filesystem read-only status", safe_call(lambda: "Yes" if not os.access("/", os.W_OK) else "No"))
-
-
-def collect_platform() -> None:
-    section("PLATFORM")
-    provider, confidence, evidence = safe_call(provider_evidence, ("Unknown", "UNKNOWN", UNKNOWN))
-    item("Detected platform", provider)
-    item("Confidence", confidence)
-    item("Evidence", evidence)
-
-
-def collect_environment() -> None:
-    section("SAFE ENVIRONMENT")
-    values = safe_call(safe_environment, [])
-    if values:
-        for value in values:
-            print(f"  {value}")
-    else:
-        print(f"  {UNKNOWN}")
-    print("  Secret-like and non-allowlisted environment variables are intentionally omitted.")
-
-
-def run_collector(name: str, collector: Callable[[], None]) -> None:
-    try:
-        collector()
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception:
-        # Keep deployment logs clean: a failed optional section is represented
-        # by a compact notice, never an exception traceback.
-        section(name)
-        item("Collector status", UNKNOWN)
-
-
-def build_inspection_report() -> str:
-    """Run the inspection once and return the complete report for stdout and HTTP."""
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        print("SYSTEM CONFIGURATION INSPECTOR")
-        print("Read-only inspection using Python standard library; no external network calls.")
-        if safe_call(platform.system) != "Linux":
-            print("Platform notice: Linux-specific files may be unavailable; collecting portable values where possible.")
-        cgroup = safe_call(cgroup_info, (UNKNOWN, None, {}, "/"))
-        collectors = (
-            ("SYSTEM", collect_system),
-            ("CPU", lambda: collect_cpu(cgroup)),
-            ("MEMORY", lambda: collect_memory(cgroup)),
-            ("STORAGE", collect_storage),
-            ("CONTAINER / CGROUP", lambda: collect_container(cgroup)),
-            ("NAMESPACES", collect_namespaces),
-            ("PROCESS", collect_process),
-            ("NETWORK", collect_network),
-            ("RUNTIME", collect_runtime),
-            ("RESOURCE ALLOCATION", lambda: collect_resource_allocation(cgroup)),
-            ("RESOURCE LIMITS", collect_resource_limits),
-            ("VIRTUALIZATION", collect_virtualization),
-            ("SECURITY", collect_security),
-            ("PLATFORM", collect_platform),
-            ("SAFE ENVIRONMENT", collect_environment),
-        )
-        for name, collector in collectors:
-            run_collector(name, collector)
-    return output.getvalue()
-
-
-def parse_report(report: str) -> dict[str, Any]:
-    """Convert the human-readable CLI report into the shared GUI data model."""
-    sections: dict[str, list[dict[str, str]]] = {}
-    current = "REPORT"
-    sections[current] = []
-    section_pattern = re.compile(r"^=+\s+(.*?)\s+=+$")
-    for line in report.splitlines():
-        match = section_pattern.match(line.strip())
-        if match:
-            current = match.group(1).strip()
-            sections.setdefault(current, [])
-            continue
-        if not line.strip() or line.startswith("SYSTEM CONFIGURATION") or line.startswith("Read-only inspection") or line.startswith("[system-config-inspector]"):
-            continue
-        if line.startswith("  "):
-            sections.setdefault(current, []).append({"label": "Environment", "value": line.strip(), "source": "allowlisted environment", "scope": "safe metadata", "confidence": "HIGH", "status": "available"})
-            continue
-        label = line[:34].strip()
-        value = line[34:].strip() if len(line) > 34 else ""
-        if label:
-            final_value = value or UNKNOWN
-            source, scope = metric_source(current, label)
-            sections.setdefault(current, []).append({"label": label, "value": final_value, "source": source, "scope": scope, "confidence": "UNKNOWN" if final_value == UNKNOWN else "MEDIUM", "status": "unavailable" if final_value == UNKNOWN else "available"})
-    flat = {(row["label"]): row["value"] for rows in sections.values() for row in rows if row["label"] != "Environment"}
-    return {"generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "report": report, "sections": sections, "flat": flat}
-
-
-def metric_source(section_name: str, label: str) -> tuple[str, str]:
-    if label.startswith("Allocated") or "allocation" in label.lower() or "quota" in label.lower() or "cgroup" in label.lower() or "PID limit" in label:
-        return "cgroup", "allocated/enforced"
-    if section_name == "MEMORY" or label in {"Visible logical CPUs", "CPU model", "Host-visible memory"}:
-        return "/proc and /sys", "visible runtime"
-    if section_name == "RESOURCE LIMITS":
-        return "Python resource", "process limit"
-    if section_name == "PLATFORM":
-        return "explicit environment", "provider evidence"
-    return "runtime inspection", "detected"
-
-
-def dashboard_value(result: dict[str, Any], label: str) -> str:
-    return result.get("flat", {}).get(label, UNKNOWN)
-
-
-def progress_percent(result: dict[str, Any], used_label: str, total_label: str) -> int | None:
-    def raw_bytes(text: str) -> int | None:
-        match = re.search(r"\(([0-9,]+) bytes\)", text)
-        return parse_int(match.group(1).replace(",", "")) if match else None
-    used = raw_bytes(dashboard_value(result, used_label))
-    total = raw_bytes(dashboard_value(result, total_label))
-    if used is None or total is None or total <= 0 or used > total:
-        return None
-    return min(100, max(0, round(used * 100 / total)))
-
-
-def dashboard_html(result: dict[str, Any]) -> str:
-    sections = result.get("sections", {})
-    flat = result.get("flat", {})
-    escaped = lambda value: html.escape(str(value), quote=True)
-    platform_value = flat.get("Detected platform", UNKNOWN)
-    container_value = flat.get("Container", flat.get("Container detected", UNKNOWN))
-    architecture = flat.get("Machine architecture", flat.get("CPU architecture", UNKNOWN))
-    cards = (
-        ("Allocated CPU", flat.get("Allocated CPU", UNKNOWN), "cgroup", "allocated/enforced"),
-        ("Memory allocation / limit", flat.get("Memory allocation / limit", UNKNOWN), "cgroup", "allocated/enforced"),
-        ("Visible storage", flat.get("Visible root filesystem total", UNKNOWN), "disk usage", "visible filesystem"),
-        ("PID allocation / limit", flat.get("PID allocation / limit", flat.get("PID limit", UNKNOWN)), "cgroup", "allocated/enforced"),
-        ("Platform", platform_value, "explicit environment", "provider evidence"),
-        ("Container", container_value, "runtime evidence", "container status"),
-        ("Architecture", architecture, "platform", "visible runtime"),
-        ("Kernel", flat.get("Kernel release", flat.get("Kernel version", UNKNOWN)), "platform", "visible runtime"),
-    )
-    card_html = "".join(f'<article class="summary-card"><div class="eyebrow">{escaped(title)}</div><div class="summary-value">{escaped(value)}</div><div class="source">Source: {escaped(source)} · Scope: {escaped(scope)}</div></article>' for title, value, source, scope in cards)
-    memory_progress = progress_percent(result, "Used visible memory", "Host-visible memory")
-    progress_html = f'<div class="progress"><span style="width:{memory_progress}%"></span></div><div class="progress-label">Visible memory usage: {memory_progress}%</div>' if memory_progress is not None else ""
-    sections_html = []
-    for section_name, rows in sections.items():
-        if section_name == "REPORT":
-            continue
-        row_html = []
-        for row in rows:
-            label, value = row["label"], row["value"]
-            source, scope = metric_source(section_name, label)
-            row_html.append(f'<tr><th>{escaped(label)}</th><td><code>{escaped(value)}</code><small>Source: {escaped(source)} · Scope: {escaped(scope)}</small></td></tr>')
-        body = "".join(row_html) or f'<tr><td colspan="2">{escaped(UNKNOWN)}</td></tr>'
-        sections_html.append(f'<details class="panel" open><summary>{escaped(section_name)}<span>{len(rows)} metrics</span></summary><table><tbody>{body}</tbody></table></details>')
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>System Config Inspector</title><style>
-:root{{--bg:#0b1220;--panel:#111c2e;--panel2:#17253a;--text:#e7eef8;--muted:#94a8c2;--line:#263952;--accent:#54d6b0;--warn:#f5c26b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}*{{box-sizing:border-box}}body{{margin:0;background:linear-gradient(135deg,#0b1220,#101b2e 60%,#0b1624);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}}main{{max-width:1500px;margin:auto;padding:28px 20px 60px}}header{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:26px}}h1{{font-size:clamp(1.6rem,3vw,2.5rem);margin:0 0 8px;letter-spacing:-.03em}}.subtitle{{color:var(--muted);margin:0}}.badges{{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}}.badge{{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:7px 11px;color:var(--accent);font:12px var(--mono)}}.summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:22px}}.summary-card,.panel{{background:rgba(17,28,46,.9);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 30px #0002}}.summary-card{{padding:17px;min-height:126px}}.eyebrow{{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}.summary-value{{font-size:1.25rem;font-weight:700;margin:12px 0 9px;overflow-wrap:anywhere}}.source,small{{color:var(--muted);font-size:.72rem;line-height:1.45}}.intro,.note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;color:var(--muted);margin-bottom:18px}}.panel{{margin:12px 0;overflow:hidden}}summary{{cursor:pointer;padding:16px 18px;font-weight:750;letter-spacing:.06em;color:var(--accent);display:flex;justify-content:space-between;gap:12px}}summary span{{font:12px var(--mono);color:var(--muted);letter-spacing:0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 16px;border-top:1px solid var(--line);text-align:left;vertical-align:top}}th{{width:31%;color:#c6d6ea;font-weight:600}}td code{{font:13px/1.5 var(--mono);color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}}td small{{display:block;margin-top:4px}}.progress{{height:8px;background:#263952;border-radius:99px;overflow:hidden;margin:12px 0 4px}}.progress span{{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#7de0ff);border-radius:99px}}.progress-label{{color:var(--muted);font:12px var(--mono)}}@media(max-width:700px){{main{{padding:20px 12px 40px}}header{{display:block}}.badges{{justify-content:flex-start;margin-top:16px}}th{{width:40%}}th,td{{padding:10px 9px}}}}
-</style></head><body><main><header><div><h1>System Config Inspector</h1><p class="subtitle">Read-only environment inspection · standard-library dashboard</p></div><div class="badges"><span class="badge">{escaped(platform_value)}</span><span class="badge">{escaped(architecture)}</span><span class="badge">{escaped(container_value)}</span></div></header><section class="overview"><h2>OVERVIEW</h2><div class="intro">Latest inspection: <code>{escaped(result.get("generated_at", UNKNOWN))}</code>. The dashboard is rendered from the same immutable inspection result printed to the CLI. No external resources or network calls are used.</div></section><section class="summary-grid">{card_html}</section><section class="note"><strong>Resource distinction:</strong> host-visible hardware and filesystem capacity are not the same as cgroup-enforced allocation. Each metric includes its source and scope. {progress_html}</section>{''.join(sections_html)}</main></body></html>'''
-
-
-class QuietReportHandler(http.server.BaseHTTPRequestHandler):
-    """Serve the immutable shared inspection result and health response."""
-
-    report = ""
-    dashboard = ""
-
-    def _send(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
-        payload = body.encode("utf-8")
+    section("RESOURCE LIMITS")
+    rlimits = [("Open files", resource.RLIMIT_NOFILE), ("Processes", getattr(resource, "RLIMIT_NPROC", None)), ("Stack", resource.RLIMIT_STACK), ("Core dump", resource.RLIMIT_CORE), ("Locked memory", resource.RLIMIT_MEMLOCK), ("Address space", resource.RLIMIT_AS), ("File size", resource.RLIMIT_FSIZE)]
+    for label, constant in rlimits:
+        if constant is None: item(label, UNKNOWN); continue
         try:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+            soft, hard = resource.getrlimit(constant); fmt=lambda x: "Unlimited" if x == resource.RLIM_INFINITY else str(x); item(label, f"{fmt(soft)} soft / {fmt(hard)} hard")
+        except (ValueError, OSError): item(label, UNKNOWN)
 
-    def do_GET(self) -> None:
-        path = urlsplit(self.path).path
-        if path == "/":
-            self._send(200, self.dashboard, "text/html; charset=utf-8")
-        elif path == "/healthz":
-            self._send(200, "ok\n")
-        else:
-            self._send(404, "Not found\n")
+    section("VIRTUALIZATION")
+    item("Virtualization", f"{v} (confidence={conf}; evidence={ev})"); item("Confidence", conf); item("Evidence", ev)
 
-    def do_HEAD(self) -> None:
-        self.do_GET()
+    section("SECURITY")
+    euid = safe(os.geteuid, -1); item("Root status", "Yes" if euid == 0 else "No" if euid >= 0 else UNKNOWN); item("Capabilities", status.get("CapEff", UNKNOWN)); item("No new privileges", status.get("NoNewPrivs", UNKNOWN)); item("Seccomp", status.get("Seccomp", UNKNOWN)); item("AppArmor", "Present" if Path("/sys/kernel/security/apparmor").exists() else UNKNOWN); item("SELinux", "Present" if Path("/sys/fs/selinux").exists() else UNKNOWN); item("Filesystem read-only status", "No" if root and "ro" not in root[3].split(",") else "Yes" if root else UNKNOWN)
 
-    def log_message(self, format: str, *args: Any) -> None:
-        # Deployment logs should contain the startup report, not one line per request.
-        return
+    section("PLATFORM")
+    pname, pconf, pevidence = provider(); item("Detected platform", pname); item("Confidence", pconf); item("Evidence", pevidence)
 
-    def do_POST(self) -> None:
-        self._send(405, "Method not allowed\n")
-
-    do_PUT = do_POST
-    do_DELETE = do_POST
+    section("SAFE ENVIRONMENT")
+    vals=env_values()
+    for x in vals: print(f"  {x}")
+    if not vals: print(f"  {UNKNOWN}")
+    print("  Secret-like and non-allowlisted environment variables are intentionally omitted.")
+    print("\n[system-config-inspector] Inspection completed successfully.")
 
 
-class InspectorHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-def parse_port() -> int:
-    raw = os.environ.get("PORT", "10000").strip()
-    try:
-        port = int(raw)
-        if 1 <= port <= 65535:
-            return port
-    except (TypeError, ValueError):
-        pass
-    print(f"[system-config-inspector] Invalid PORT={raw!r}; using fallback port 10000.")
-    return 10000
-
-
-def serve_report(result: dict[str, Any], port: int) -> None:
-    QuietReportHandler.report = result.get("report", "")
-    QuietReportHandler.dashboard = dashboard_html(result)
-    server = InspectorHTTPServer(("0.0.0.0", port), QuietReportHandler)
-    stopping = {"value": False}
-
-    def shutdown_handler(signum: int, _frame: Any) -> None:
-        if not stopping["value"]:
-            stopping["value"] = True
-            print(f"\n[system-config-inspector] Shutdown signal {signum} received; stopping HTTP server.", flush=True)
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    print(f"[system-config-inspector] HTTP server listening on 0.0.0.0:{port}", flush=True)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    finally:
-        server.server_close()
-        print("[system-config-inspector] HTTP server stopped.", flush=True)
-
-
-def selected_mode() -> str:
-    mode = os.environ.get("INSPECTOR_MODE", "serve").strip().lower()
-    for argument in sys.argv[1:]:
-        if argument == "--once":
-            mode = "once"
-        elif argument == "--serve":
-            mode = "serve"
-    return mode if mode in {"once", "serve"} else "serve"
+def serve() -> None:
+    """Keep a deployment process alive without exposing a dashboard or API."""
+    import http.server
+    import socketserver
+    port = integer(os.environ.get("PORT", "10000")) or 10000
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path.split("?", 1)[0] == "/healthz":
+                body=b"ok\n"; self.send_response(200)
+            else:
+                body=b"system-config-inspector is running; see deployment logs for the inspection report.\n"; self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self, *_: Any) -> None: return
+    server=socketserver.TCPServer(("0.0.0.0", port), Handler)
+    stopping=False
+    def stop(signum: int, _frame: Any) -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping=True; print(f"\n[system-config-inspector] Shutdown signal {signum} received.", flush=True); threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+    print(f"[system-config-inspector] Long-running mode: 0.0.0.0:{port} (health check only; no GUI/API).", flush=True)
+    try: server.serve_forever(poll_interval=0.5)
+    finally: server.server_close()
 
 
 def main() -> int:
-    try:
-        mode = selected_mode()
-        if mode == "serve":
-            print("[system-config-inspector] Starting read-only runtime inspection...", flush=True)
-        report = build_inspection_report()
-        completed_report = report + "\n[system-config-inspector] Inspection completed successfully.\n"
-        result = parse_report(completed_report)
-        print(completed_report, end="", flush=True)
-        if mode == "once":
-            return 0
-        serve_report(result, parse_port())
-        return 0
-    except KeyboardInterrupt:
-        print("\n[system-config-inspector] Inspection interrupted; shutting down.", file=sys.stderr)
-        return 130
-    except Exception as exc:
-        print(f"[system-config-inspector] Fatal application failure: {exc}", file=sys.stderr)
-        return 1
-
+    mode = os.environ.get("INSPECTOR_MODE", "once").strip().lower()
+    if "--serve" in sys.argv[1:]: mode="serve"
+    if "--once" in sys.argv[1:]: mode="once"
+    collect()
+    if mode == "serve": serve()
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
